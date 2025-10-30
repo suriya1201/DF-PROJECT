@@ -343,43 +343,54 @@ def walk_page_table_x86_64(virtual_address: int, cr3: int, mem: MemoryImage) -> 
     return phys_base + page_offset
 
 
-def example_usage() -> None:
+def demonstrate_rootkit_lifecycle() -> None:
     """
     Demonstration of rootkit-like behavior using PTE and MAS manipulation.
+
+    This function simulates how a rootkit could maintain two different views
+    of a memory page to hide its code from scanners.
+
+    - The "Scanner View" makes the page look like non-executable data.
+    - The "Rootkit View" maps the page to its malicious code and makes it
+      executable right before it needs to run.
+
+    NOTE: This is a simulation. A real implementation would require kernel-level
+    code to modify the system's actual page tables and would need to flush
+    the TLB (Translation Lookaside Buffer) after each change.
     """
     # --- Setup: Define memory layout and initial page table ---
 
     # Let's define some addresses for our scenario.
     TARGET_VIRTUAL_ADDRESS = 0x4000_1000
     CLEAN_PHYSICAL_PAGE = 0x8001_0000  # Physical page with legitimate code
-    MALICIOUS_PHYSICAL_PAGE = 0x9002_0000  # Physical page with rootkit code
+    ROOTKIT_CODE_PAGE = 0x9002_0000  # Physical page where your program's code resides
 
-    # Create a Page Table Entry (PTE) for a target virtual address.
-    # Initially, it points to the "clean" physical page.
-    # Flags: Present, User, Writable, Executable (XD=0).
+    # This is the "normal" PTE for your program's code page.
+    # It's present, writable, and executable (Execute Disable bit is 0).
     initial_pte_value = (
-        CLEAN_PHYSICAL_PAGE | PteFlag.PRESENT | PteFlag.USER | PteFlag.WRITE
+        ROOTKIT_CODE_PAGE | PteFlag.PRESENT | PteFlag.USER | PteFlag.WRITE
     )
     initial_pte = PageTableEntry(value=initial_pte_value)
 
     # Create a page table with this single entry.
     table = PageTable(entries={TARGET_VIRTUAL_ADDRESS: initial_pte})
 
-    print("--- Initial 'Normal' Memory View ---")
-    print("The page table initially maps the target VA to the clean page.")
+    print("--- Step 1: Initial 'Normal' State (Rootkit is active) ---")
+    print("The PTE points to your program's code and is executable.")
     for line in dump_table(table):
         print(line)
     print("-" * 20)
 
-    # --- Hiding Technique 1: PTE Manipulation for Stealth ---
-    # A forensics tool scans memory. The rootkit hides by marking its page
-    # as non-executable and changing its cache attributes to look like data.
+    # --- Step 2: Create the "Scanner View" to Hide the Program ---
+    # A forensics tool or the OS scheduler is about to inspect this memory.
+    # The rootkit must modify the PTE to hide its presence.
 
-    print("\n--- Rootkit Hiding (Scanner Active) ---")
-    print("A scanner is detected. Rootkit modifies PTE to hide.")
+    print("\n--- Step 2: Hiding the Program (Creating the 'Scanner View') ---")
+    print("A scanner is detected. The rootkit modifies the PTE to hide.")
 
-    # 1. Apply MAS remapping to change memory type to Write-Combine (often used for device memory).
-    # This can evade detectors that look for code in standard Write-Back memory.
+    # STRATEGY 1: Make the code page look like non-executable data.
+    # We will mark the page as non-executable and change its cache attribute
+    # to "Write-Combine", which is unusual for code and may evade some checks.
     rules = [
         MASRule(
             TARGET_VIRTUAL_ADDRESS,
@@ -387,44 +398,50 @@ def example_usage() -> None:
             MemoryAttribute.WRITE_COMBINE,
         )
     ]
-    hidden_table = apply_mas_remap(table, rules)
+    scanner_view_table = apply_mas_remap(table, rules)
 
-    # 2. Use bulk_update_flags to mark the page as non-executable (Execute Disable).
     predicate = {TARGET_VIRTUAL_ADDRESS: True}
-    hidden_table = bulk_update_flags(
-        hidden_table,
+    scanner_view_table = bulk_update_flags(
+        scanner_view_table,
         predicate,
         set_flags=PteFlag.EXECUTE_DISABLE,
     )
 
-    print("PTE is now non-executable and has a different memory attribute.")
-    for line in dump_table(hidden_table):
+    print("\n  View for Scanner (non-executable, looks like data):")
+    for line in dump_table(scanner_view_table):
         print(line)
+
+    # STRATEGY 2 (More Advanced): Remap to a completely different page.
+    # This is the most effective hiding technique. The virtual address now
+    # points to a harmless physical page. A scanner reading the VA will see
+    # the contents of the clean page, not your rootkit.
+    entry_to_hide = table.entries[TARGET_VIRTUAL_ADDRESS]
+    fully_hidden_entry = entry_to_hide.with_frame_address(
+        CLEAN_PHYSICAL_PAGE
+    ).with_flags(set_flags=PteFlag.EXECUTE_DISABLE)
+
+    fully_hidden_table = table.copy()
+    fully_hidden_table.update(TARGET_VIRTUAL_ADDRESS, fully_hidden_entry)
+
+    print("\n  View for Scanner (remapped to a clean page):")
+    for line in dump_table(fully_hidden_table):
+        print(line)
+
     print("-" * 20)
 
-    # --- Hiding Technique 2: Remapping to Malicious Code ---
-    # The rootkit needs to execute. It remaps the virtual address to its
-    # own physical code page and ensures it's executable.
+    # --- Step 3: Activate the Program for Execution ---
+    # The scanner is gone, and your program needs to run. It must restore
+    # the original PTE so the CPU can fetch and execute its instructions.
 
-    print("\n--- Rootkit Activation (Execution) ---")
-    print("Rootkit remaps the VA to its own code and makes it executable.")
+    print("\n--- Step 3: Activating the Program (Restoring 'Rootkit View') ---")
+    print("Scanner is gone. Rootkit restores the original PTE to execute.")
 
-    # Get the original PTE from the "normal" view table.
-    entry_to_modify = table.entries[TARGET_VIRTUAL_ADDRESS]
+    # The "Rootkit View" is simply the original, correct mapping.
+    # In a real scenario, the rootkit would atomically swap the "Scanner View"
+    # PTE with this "Rootkit View" PTE.
+    rootkit_view_table = table.copy()  # This is our original `table`
 
-    # Create the rootkit's view by remapping the frame address and ensuring it's executable.
-    rootkit_view_entry = entry_to_modify.with_frame_address(
-        MALICIOUS_PHYSICAL_PAGE
-    ).with_flags(clear_flags=PteFlag.EXECUTE_DISABLE)
-
-    rootkit_table = table.copy()
-    rootkit_table.update(TARGET_VIRTUAL_ADDRESS, rootkit_view_entry)
-
-    print("PTE now points to malicious code and is executable.")
-    for line in dump_table(rootkit_table):
+    print("PTE now points back to the real code and is executable again.")
+    for line in dump_table(rootkit_view_table):
         print(line)
     print("-" * 20)
-
-
-if __name__ == "__main__":
-    example_usage()
